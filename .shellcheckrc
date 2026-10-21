@@ -1,0 +1,9 @@
+# Project-wide shellcheck policy for vps-setup.sh.
+#
+# SC2317 (unreachable commands) and SC2329 (never-invoked functions) fire on
+# every task_* function because dispatch is indirect: main() passes function
+# NAMES to run_task(), which calls "$3". Shellcheck cannot see that call
+# graph, and the same applies to trap handlers referenced inside quoted
+# strings. Both checks are suppressed here; all other findings stay enabled.
+disable=SC2317
+disable=SC2329
