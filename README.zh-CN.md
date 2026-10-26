@@ -6,6 +6,9 @@
 脚本。单文件、除标准 systemd 发行版外零依赖、完全幂等，并以满足常见社区
 VPS 安全审计检查项为构建目标。
 
+> **注意：** 本脚本仅在 Debian 13 上测试过。其他受支持的发行版有代码适配，
+> 但未经测试。
+
 ```bash
 curl -fsSL https://github.com/linhe0x0/vps-setup/raw/refs/heads/main/vps-setup.sh | sudo bash
 ```

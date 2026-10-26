@@ -7,6 +7,9 @@ server (AWS EC2 or any cloud VPS). One file, no dependencies beyond a
 standard systemd distribution, fully idempotent, and built to pass common
 community VPS security audits.
 
+> **Note:** This script has only been tested on Debian 13. The other
+> supported distributions are handled by the code but are untested.
+
 ```bash
 curl -fsSL https://github.com/linhe0x0/vps-setup/raw/refs/heads/main/vps-setup.sh | sudo bash
 ```
