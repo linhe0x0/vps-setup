@@ -50,17 +50,9 @@
 #=============================================================================
 
 set -uo pipefail
-# SC2317/SC2329 (unreachable / never-invoked functions) are suppressed in
-# .shellcheckrc: task_* functions are dispatched indirectly via run_task
-# ("$3") and trap handlers are referenced inside quoted strings, neither of
-# which shellcheck can see. All other findings stay enabled.
 export LC_ALL=C
 umask 077
 
-#=============================================================================
-# Constants
-# NOTE: do NOT use the name VERSION — sourcing /etc/os-release defines it.
-#=============================================================================
 readonly SCRIPT_VERSION="1.0.0"
 readonly BASE_DIR="/var/vps-setup"
 readonly BK_DIR="${BASE_DIR}/backups"
@@ -69,16 +61,10 @@ readonly LOCK_FILE="${BASE_DIR}/lock"
 readonly CONFIRM_FLAG="${BASE_DIR}/.ssh-confirmed"
 readonly DMS_UNIT_BASE="vps-setup-dms"
 readonly STEP_TOTAL=12
-# Hard bound on the post-restart confirmation gate. A silently dropped SSH
-# connection keeps the server-side pty open, so an unbounded read would block
-# the run forever — and the dead-man switch keeps yielding while this process
-# holds the lock. The bound is what makes the auto-rollback promise true.
 readonly GATE_TIMEOUT=900
 readonly SSHD_CONFIG="/etc/ssh/sshd_config"
 readonly SSHD_DROPIN_DIR="/etc/ssh/sshd_config.d"
 readonly SSHD_DROPIN="${SSHD_DROPIN_DIR}/00-vps-setup-hardening.conf"
-# Files whose Port directives were stripped for this run. Rollback restores
-# them from $BK_DIR; the list is removed once the change is confirmed.
 readonly PORT_STRIP_LIST="${BASE_DIR}/ssh-port-strip.list"
 readonly F2B_JAIL_LOCAL="/etc/fail2ban/jail.local"
 readonly PWQUALITY_CONF="/etc/security/pwquality.conf"
@@ -94,22 +80,19 @@ else
     GREEN=""; YELLOW=""; RED=""; CYAN=""; BOLD=""; NC=""
 fi
 
-#=============================================================================
-# State (globals filled during detection / input collection / execution)
-#=============================================================================
 OK_N=0; SKIP_N=0; WARN_N=0; ERR_N=0
 REPORT_FINALIZED=0
 
-FAMILY=""            # debian | rhel
+FAMILY=""
 DISTRO_PRETTY="unknown"
-PKG="apt-get"        # apt-get | dnf | yum
-ADMIN_GROUP="sudo"   # sudo (Debian/Ubuntu) | wheel (RHEL family)
-FW_KIND="ufw"        # ufw | firewalld
+PKG="apt-get"
+ADMIN_GROUP="sudo"
+FW_KIND="ufw"
 SSHD_BIN="/usr/sbin/sshd"
 SSH_UNIT="ssh.service"
 KBD_KEYWORD="KbdInteractiveAuthentication"
-SSH_SOCKET_MODE=0    # 1 = sshd is systemd socket-activated (ssh.socket)
-ALL_SSH_PORTS=(22)   # every Port currently configured in sshd
+SSH_SOCKET_MODE=0
+ALL_SSH_PORTS=(22)
 SSH_PORT_ORIG=22
 SSH_PORT_FINAL=22
 SSH_PORT_CHANGED=0
@@ -124,21 +107,17 @@ EXTRA_PORTS=()
 DO_UPGRADE=1
 DO_AUTOUPDATES=1
 PKG_INDEX_UPDATED=0
-APT_DAILY_STOPPED=0     # 1 = apt-daily timers/services paused for this run
-APT_DAILY_WAS_ACTIVE="" # apt-daily timers that were active before the pause
-APT_BUSY_CHOICE=""      # answer chosen in resolve_busy_apt (wait|stop|abort)
+APT_DAILY_STOPPED=0
+APT_DAILY_WAS_ACTIVE=""
+APT_BUSY_CHOICE=""
 
 SSH_HARDEN_APPLIED=0
 DMS_UNIT=""
 DMS_SCRIPT=""
-PROMPT_TTY=""        # set when stdin is piped: prompts read from /dev/tty
+PROMPT_TTY=""
 RESULT_FILE=""
 
-#=============================================================================
-# Logging helpers — every result is printed in a uniform, greppable format
-# AND mirrored (plain text, no colors) into the persistent execution report.
-#=============================================================================
-_log_append() { # $1 = tag, rest = message
+_log_append() {
     local tag="$1"
     shift
     if [ -n "${RESULT_FILE:-}" ]; then
@@ -161,7 +140,7 @@ die() {
 on_interrupt() {
     printf '\n'
     log_warn "Interrupted — configuration may be partial. Re-run this script to resume safely (idempotent)."
-    exit 130    # the EXIT trap finalizes the report
+    exit 130
 }
 
 on_exit() {
@@ -173,9 +152,6 @@ on_exit() {
     fi
 }
 
-#=============================================================================
-# Persistent execution report (audit trail under /var/vps-setup/reports/)
-#=============================================================================
 init_report() {
     mkdir -p "$RESULT_DIR"
     RESULT_FILE="${RESULT_DIR}/report-$(date '+%Y%m%d-%H%M%S').log"
@@ -187,8 +163,6 @@ init_report() {
     chmod 600 "$RESULT_FILE"
 }
 
-# Record the user-approved decisions once. Secrets (passwords) are NEVER
-# written to the report; only key fingerprints, never key material.
 report_decisions() {
     local n_keys=0 fp
     if [ -n "$SSH_KEYS_CONTENT" ]; then
@@ -214,7 +188,6 @@ report_decisions() {
     } >> "$RESULT_FILE"
 }
 
-# Closing block for the report: counters, endpoint, backups, final status.
 finalize_report() {
     local b
     {
@@ -234,9 +207,6 @@ finalize_report() {
     REPORT_FINALIZED=1
 }
 
-#=============================================================================
-# Small utility helpers
-#=============================================================================
 cmd_exists() { command -v "$1" >/dev/null 2>&1; }
 
 pkg_installed() {
@@ -247,8 +217,6 @@ pkg_installed() {
     esac
 }
 
-# Non-blocking concurrency guard: never waits, so it can never deadlock.
-# fd 9 is released automatically on ANY exit path (INT/TERM/kill -9 included).
 acquire_lock() {
     local lock_dir
     lock_dir=$(dirname "$LOCK_FILE")
@@ -264,7 +232,6 @@ acquire_lock() {
     fi
 }
 
-# Back up a file once per host so the FIRST pre-script state is always kept.
 backup_file() {
     local f="$1"
     local target
@@ -276,10 +243,7 @@ backup_file() {
     fi
 }
 
-# M5: every interactive read goes through here. EOF (Ctrl-D) is fatal —
-# it must never spin in a tight error loop. When executed through a pipe
-# (curl | sudo bash), reads are served from the controlling terminal.
-prompt_read() { # $1 prompt, $2 varname, [$3 = 1 for silent input]
+prompt_read() {
     local rc
     if [ -n "$PROMPT_TTY" ]; then
         if [ "${3:-0}" = "1" ]; then
@@ -301,10 +265,7 @@ prompt_read() { # $1 prompt, $2 varname, [$3 = 1 for silent input]
     fi
 }
 
-# Bounded variant used by the confirmation gate. The plain read in prompt_read
-# never returns when the TCP flow is black-holed (the pty stays open).
-# Returns 0 on a line, 1 on EOF, >128 on timeout.
-prompt_read_timeout() { # $1 prompt, $2 varname, $3 timeout in seconds
+prompt_read_timeout() {
     if [ -n "$PROMPT_TTY" ]; then
         read -r -t "$3" -p "$1" "$2" < "$PROMPT_TTY"
     else
@@ -312,7 +273,7 @@ prompt_read_timeout() { # $1 prompt, $2 varname, $3 timeout in seconds
     fi
 }
 
-confirm_yn() { # $1 question, $2 default: y|n
+confirm_yn() {
     local ans
     if [ "${2:-y}" = "y" ]; then
         prompt_read "$1 [Y/n]: " ans
@@ -336,7 +297,6 @@ validate_pubkey() {
     return 1
 }
 
-# M3: recover a dpkg state left broken by a previously interrupted upgrade.
 ensure_dpkg_recovered() {
     local audit
     cmd_exists dpkg || return 0
@@ -351,11 +311,6 @@ ensure_dpkg_recovered() {
     return 1
 }
 
-# Regex for processes that run or serve apt/dpkg work. Every alternative is
-# anchored with ($| ) so it matches the program itself, not incidental text
-# (log paths, the ever-running 'unattended-upgrade-shutdown' helper process
-# of unattended-upgrades.service, which holds no lock and used to stall
-# every wait here for the full timeout).
 readonly APT_BUSY_PGREP='(^|/)apt-get($| )|(^|/)apt($| )|(^|/)dpkg($| )|(^|/)unattended-upgrade($| )'
 
 apt_busy() {
@@ -375,8 +330,7 @@ apt_holder_desc() {
     printf 'PID %s (%s)' "$pid" "${args:-just exited}"
 }
 
-# Asked once per ~5-minute wait window while apt/dpkg is still busy.
-resolve_busy_apt() { # $1 holder description; sets APT_BUSY_CHOICE
+resolve_busy_apt() {
     log_warn "apt/dpkg is still busy after ~5 minutes ($1)."
     if [ "$APT_DAILY_STOPPED" -eq 1 ]; then
         die "Daily auto-update tasks were already stopped but apt/dpkg is still busy. Resolve it manually, then re-run this script."
@@ -394,11 +348,6 @@ resolve_busy_apt() { # $1 holder description; sets APT_BUSY_CHOICE
     done
 }
 
-# Pause apt's daily update machinery at user request so this run can use
-# apt/dpkg immediately. Timers stop first to prevent a re-trigger; the
-# services stop gracefully (KillMode=process lets the running upgrade
-# finish its current package and checkpoint state for the next scheduled
-# run). What was active before is restarted by restore_apt_daily_timers.
 stop_apt_daily_units() {
     local t
     for t in apt-daily.timer apt-daily-upgrade.timer; do
@@ -413,9 +362,6 @@ stop_apt_daily_units() {
     log_ok "apt-daily timers/services stopped"
 }
 
-# Restart the apt-daily timers paused by stop_apt_daily_units. Called from
-# main() after the tasks and again from on_exit, so every exit path
-# (normal end, die, interrupt) hands the daily updates back.
 restore_apt_daily_timers() {
     [ "$APT_DAILY_STOPPED" -eq 1 ] || return 0
     APT_DAILY_STOPPED=0
@@ -430,10 +376,6 @@ restore_apt_daily_timers() {
     APT_DAILY_WAS_ACTIVE=""
 }
 
-# Wait (with visible progress) until no apt/dpkg work is running, then let
-# the caller proceed. An idle system passes immediately. If work is still
-# running after ~5 minutes, the user chooses: keep waiting, stop the daily
-# auto-update tasks (they are restored when the run ends), or abort.
 wait_for_apt_lock() {
     local i=0 waited=0 desc
     while :; do
@@ -462,9 +404,6 @@ wait_for_apt_lock() {
     done
 }
 
-# Refresh the package index once per run. Debian uses apt-get update; the
-# RHEL family uses makecache (yum and dnf both support it). A failure is
-# reported but not fatal: the install attempt may still work with cached data.
 refresh_pkg_index() {
     [ "$PKG_INDEX_UPDATED" -eq 1 ] && return 0
     case "$FAMILY" in
@@ -492,10 +431,6 @@ refresh_pkg_index() {
     return 1
 }
 
-# Install packages one by one so a single unavailable package cannot block
-# the others. Refreshes the index first (once per run). Returns 2 when
-# nothing was missing, 0 when every missing package was installed, and 1
-# when at least one installation failed.
 install_pkgs() {
     local missing=() failed=() p
     for p in "$@"; do
@@ -537,10 +472,6 @@ install_pkgs() {
     return 0
 }
 
-# Public IP hint for the interactive SSH test. Cloudflare's trace endpoint
-# reports the address the request came from, so it works on any provider.
-# The routing-table fallback only helps when the host itself has a public
-# address; on EIP/NAT setups it returns the private VPC address.
 public_ip_hint() {
     local ip=""
     if cmd_exists curl; then
@@ -555,10 +486,7 @@ public_ip_hint() {
     printf '%s' "$ip"
 }
 
-# True for addresses that cannot be reached from the internet: RFC1918,
-# CGNAT, loopback, link-local. The routing-table fallback returns one of
-# these on NAT/EIP hosts, where it is useless as an SSH target.
-is_private_address() { # $1 IPv4/IPv6 address
+is_private_address() {
     case "$1" in
         10.*|127.*|0.*|192.168.*|169.254.*) return 0 ;;
         172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
@@ -568,8 +496,6 @@ is_private_address() { # $1 IPv4/IPv6 address
     return 1
 }
 
-# Address used in the "ssh ..." hints. A private address is replaced by a
-# placeholder so the script never prints a command that cannot work.
 ssh_address_hint() {
     local ip
     ip=$(public_ip_hint)
@@ -580,9 +506,6 @@ ssh_address_hint() {
     fi
 }
 
-#=============================================================================
-# Environment detection
-#=============================================================================
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
         die "This script must run as root. Try: sudo bash $0"
@@ -593,9 +516,6 @@ require_tty() {
     if [ -t 0 ]; then
         return 0
     fi
-    # Piped execution (e.g. curl | sudo bash): the script itself keeps
-    # reading from stdin; only the interactive prompts are bound to the
-    # controlling terminal, so a prompt can never consume the script source.
     if (exec 0</dev/tty) 2>/dev/null && [ -c /dev/tty ]; then
         PROMPT_TTY="/dev/tty"
         log_info "Piped stdin detected — interactive prompts bound to /dev/tty"
@@ -604,11 +524,6 @@ require_tty() {
     die "No interactive terminal detected. Run this script directly in an SSH session: sudo bash $0"
 }
 
-# Pick the keyword this OpenSSH build understands. `sshd -T` emits only the
-# canonical name (kbdinteractiveauthentication) on 8.7+, so grepping its
-# output through a pipe is fragile: `grep -q` exits early and the resulting
-# SIGPIPE can make the pipeline fail under `pipefail`. Cache the output and
-# match it with a here-string instead.
 detect_kbd_keyword() {
     local dump
     dump=$("$SSHD_BIN" -T 2>/dev/null) || dump=""
@@ -625,7 +540,6 @@ detect_os() {
     if [ ! -r /etc/os-release ]; then
         die "/etc/os-release not found — unsupported or unknown system."
     fi
-    # shellcheck disable=SC1091
     . /etc/os-release
     id="${ID:-}"
     version_id="${VERSION_ID:-}"
@@ -654,7 +568,6 @@ detect_os() {
 
     SSHD_BIN="$(command -v sshd || printf '/usr/sbin/sshd')"
 
-    # Detect the SSH unit: prefer whichever is actually running.
     local u
     SSH_UNIT=""
     for u in ssh.service sshd.service; do
@@ -667,19 +580,14 @@ detect_os() {
     fi
     [ -z "$SSH_UNIT" ] && SSH_UNIT="ssh.service"
 
-    # H3: Ubuntu 22.10+ / Debian 13+ socket-activate sshd. In that mode the
-    # listening port is owned by ssh.socket (ListenStream) and the Port
-    # directive is ignored, so it must be detected — never guessed by version.
     SSH_SOCKET_MODE=0
     if systemctl is-enabled ssh.socket >/dev/null 2>&1 \
         || systemctl is-active --quiet ssh.socket 2>/dev/null; then
         SSH_SOCKET_MODE=1
     fi
 
-    # Older OpenSSH (< 8.7) only knows ChallengeResponseAuthentication.
     detect_kbd_keyword
 
-    # All currently configured SSH ports (first one is the managed default).
     local p valid=()
     mapfile -t ALL_SSH_PORTS < <(effective_ssh_ports | tr ' ' '\n' | grep -E '^[0-9]+$')
     for p in ${ALL_SSH_PORTS[@]+"${ALL_SSH_PORTS[@]}"}; do
@@ -697,8 +605,6 @@ detect_os() {
     fi
     SSH_PORT_FINAL="$SSH_PORT_ORIG"
 
-    # Drop-ins only take effect reliably when the Include sits at the top of
-    # sshd_config (sshd uses first-match-wins).
     DROPIN_SUPPORTED=0
     if [ -d "$SSHD_DROPIN_DIR" ]; then
         local inc_line first_line
@@ -712,21 +618,15 @@ detect_os() {
     fi
 }
 
-sshd_effective() { # $1 keyword -> prints effective value
+sshd_effective() {
     local kw="$1" val
     val=$("$SSHD_BIN" -T 2>/dev/null | awk -v k="$kw" 'tolower($1)==tolower(k){print $2; exit}')
-    # `sshd -T` only echoes the canonical name. Configs written with the
-    # deprecated alias still take effect, so fall back to the canonical key
-    # when the alias is not reported.
     if [ -z "$val" ] && [ "$kw" = "ChallengeResponseAuthentication" ]; then
         val=$("$SSHD_BIN" -T 2>/dev/null | awk 'tolower($1)=="kbdinteractiveauthentication"{print $2; exit}')
     fi
     printf '%s' "$val"
 }
 
-# Ports sshd actually listens on, sorted and space-separated. With socket
-# activation sshd_config's Port is ignored because ssh.socket owns the port,
-# so sshd -T would report the wrong number.
 effective_ssh_ports() {
     local ports=""
     if [ "$SSH_SOCKET_MODE" -eq 1 ]; then
@@ -739,9 +639,6 @@ effective_ssh_ports() {
     printf '%s' "${ports% }"
 }
 
-#=============================================================================
-# Input collection (all user data is gathered BEFORE anything is changed)
-#=============================================================================
 ask_username() {
     while :; do
         prompt_read "Admin username to create: " NEW_USER
@@ -768,9 +665,7 @@ ask_username() {
     log_ok "Admin user: $NEW_USER"
 }
 
-# H2: the local prompt enforces the exact same policy pwquality will enforce
-# at chpasswd time (min 14 chars, ALL four character classes required).
-prompt_valid_password() { # sets ADMIN_PW
+prompt_valid_password() {
     local pw1 pw2 cls
     while :; do
         prompt_read "Password for '$NEW_USER' (min 14 chars, ALL 4 character classes): " pw1 1
@@ -799,10 +694,9 @@ prompt_valid_password() { # sets ADMIN_PW
     done
 }
 
-verify_password_hash_strength() { # $1 user
+verify_password_hash_strength() {
     local hash
     hash=$(getent shadow "$1" 2>/dev/null | cut -d: -f2)
-    # shellcheck disable=SC2016  # case patterns: literal '$' is intentional
     case "$hash" in
         '$y$'*|'$gy$'*|'$6$'*|'$5$'*|'$7$'*|'$2b$'*|'$2a$'*|'$2y$'*)
             log_ok "Password stored with a strong hash algorithm"
@@ -865,8 +759,6 @@ ask_ssh_key() {
             log_error "That does not look like a valid public key (ssh-keygen rejected it). Try again."
         done
     fi
-    # H1: with no key anywhere, disabling password auth would lock the user
-    # out. Make the decision explicit instead of silently proceeding.
     if [ -z "$SSH_KEYS_CONTENT" ]; then
         while :; do
             printf '\n'
@@ -990,9 +882,6 @@ collect_all_inputs() {
     ask_toggles
 }
 
-#=============================================================================
-# Plan display + final confirmation
-#=============================================================================
 show_plan() {
     local ip
     ip=$(ssh_address_hint)
@@ -1080,9 +969,6 @@ final_confirm() {
     [ "$ans" = "yes" ]
 }
 
-#=============================================================================
-# Task 1 — base packages + system upgrade
-#=============================================================================
 task_system_update() {
     local rc=0 cnt=0
 
@@ -1136,10 +1022,7 @@ task_system_update() {
     fi
 }
 
-#=============================================================================
-# Task 2 — password quality policy
-#=============================================================================
-ensure_pwquality_line() { # $1 key, $2 value
+ensure_pwquality_line() {
     local key="$1" val="$2"
     if grep -Eq "^[[:space:]]*${key}[[:space:]]*=[[:space:]]*${val}[[:space:]]*$" "$PWQUALITY_CONF"; then
         log_skip "pwquality ${key} already set to ${val}"
@@ -1167,9 +1050,6 @@ task_password_policy() {
     ensure_pwquality_line ocredit -1
 }
 
-#=============================================================================
-# Task 3 — sudo audit logging
-#=============================================================================
 task_sudo_logging() {
     local line='Defaults logfile="/var/log/sudo.log"'
     local tmp n
@@ -1184,7 +1064,6 @@ task_sudo_logging() {
     fi
 
     if grep -Eq '^[@#]includedir[[:space:]]+/etc/sudoers\.d' "$SUDOERS_FILE"; then
-        # Prefer a validated drop-in: smaller diff, trivially reversible.
         tmp=$(mktemp) || return 0
         printf '%s\n' "$line" > "$tmp"
         if ! visudo -cf "$tmp" >/dev/null 2>&1; then
@@ -1201,7 +1080,6 @@ task_sudo_logging() {
             log_error "aggregate sudoers validation failed — drop-in removed"
         fi
     else
-        # Legacy fallback: no includedir — edit the main file with validation.
         backup_file "$SUDOERS_FILE"
         tmp=$(mktemp) || return 0
         n=$(grep -n '^Defaults' "$SUDOERS_FILE" | tail -1 | cut -d: -f1)
@@ -1221,10 +1099,7 @@ task_sudo_logging() {
     fi
 }
 
-#=============================================================================
-# Task 4 — admin user, sudo group, password, SSH keys
-#=============================================================================
-install_user_keys() { # $1 user, $2 keys content
+install_user_keys() {
     local user="$1" keys="$2" home group line
     home=$(getent passwd "$user" | cut -d: -f6)
     group=$(id -gn "$user")
@@ -1270,10 +1145,6 @@ task_admin_user() {
         fi
     fi
 
-    # H2: the password is what makes sudo usable — setting it is mandatory.
-    # chpasswd goes through PAM, so pwquality re-checks it here; retry with a
-    # new prompt instead of failing silently. If it still fails, abort BEFORE
-    # SSH hardening so the box can never end up keyless AND passwordless.
     if [ -n "$ADMIN_PW" ]; then
         local attempt=1 pw_ok=0
         while [ "$attempt" -le 3 ]; do
@@ -1296,7 +1167,6 @@ task_admin_user() {
         fi
     fi
 
-    # Valid shell is required by the security audit.
     local shell
     shell=$(getent passwd "$NEW_USER" | cut -d: -f7)
     if [ "$shell" = "/usr/sbin/nologin" ] || [ "$shell" = "/bin/false" ]; then
@@ -1322,8 +1192,6 @@ task_admin_user() {
         log_skip "No SSH key provided for $NEW_USER"
     fi
 
-    # Keep root's authorized_keys present: root login stays disabled, but the
-    # community audit checks for the file when run via sudo.
     if [ -s "$ROOT_KEYS_FILE" ]; then
         log_skip "Root authorized_keys already exists (root login remains disabled)"
     elif [ -n "$SSH_KEYS_CONTENT" ]; then
@@ -1334,10 +1202,7 @@ task_admin_user() {
     fi
 }
 
-#=============================================================================
-# Task 5 — file permissions
-#=============================================================================
-ensure_perm() { # $1 path, $2 mode
+ensure_perm() {
     local f="$1" want="$2" cur
     if [ ! -e "$f" ]; then
         log_error "$f does not exist"
@@ -1365,10 +1230,7 @@ task_permissions() {
     chown root:root /etc/passwd /etc/shadow 2>/dev/null || true
 }
 
-#=============================================================================
-# Task 6 — firewall (ufw on Debian/Ubuntu, firewalld on RHEL family)
-#=============================================================================
-fw_allow_port() { # $1 port — allows tcp/$1; returns 1 on failure (never silent)
+fw_allow_port() {
     local port="$1"
     if [ "$FW_KIND" = "ufw" ]; then
         if ufw status 2>/dev/null | grep -q "^${port}/tcp"; then
@@ -1395,9 +1257,7 @@ fw_allow_port() { # $1 port — allows tcp/$1; returns 1 on failure (never silen
     return 1
 }
 
-# Close a single port. Used on paths where the 'ssh' service must NOT be
-# touched (reclaims and rollbacks — the original port may still use it).
-fw_close_port() { # $1 port
+fw_close_port() {
     local port="$1"
     if [ "$FW_KIND" = "ufw" ]; then
         if ufw status 2>/dev/null | grep -q "^${port}/tcp"; then
@@ -1423,10 +1283,7 @@ fw_close_port() { # $1 port
     fi
 }
 
-# Called only AFTER the new SSH port was verified: close an old port and, on
-# firewalld, the 'ssh' service that shipped pre-opened on port 22 (only when
-# 22 is no longer the managed port).
-fw_close_old_ssh() { # $1 old port
+fw_close_old_ssh() {
     local port="$1"
     fw_close_port "$port"
     if [ "$FW_KIND" != "ufw" ] && [ "$SSH_PORT_FINAL" -ne 22 ] \
@@ -1454,8 +1311,6 @@ task_firewall() {
             log_error "ufw not found — ufw is not installed (see the package errors above)"
             return 0
         fi
-        # Safety: allow the SSH ports BEFORE enabling default-deny. A failure
-        # here is fatal for this task — never deny-by-default with SSH closed.
         for p in "${ports_to_allow[@]}"; do
             if ! fw_allow_port "$p"; then
                 log_error "Refusing to enable default-deny: tcp/$p could not be allowed"
@@ -1500,9 +1355,6 @@ task_firewall() {
             log_skip "firewalld already running"
         fi
         if [ "$firewalld_was_active" -eq 0 ]; then
-            # H4: pre-stage the permanent rules BEFORE first start. Starting
-            # firewalld applies its default zone immediately; if that zone has
-            # no 'ssh' service, the running session dies mid-script.
             if ! cmd_exists firewall-offline-cmd; then
                 log_error "firewalld is inactive and firewall-offline-cmd is missing — refusing to start it (would risk cutting SSH)"
                 return 0
@@ -1543,11 +1395,6 @@ task_firewall() {
     fi
 }
 
-#=============================================================================
-# Task 7 — SSH hardening (+ optional port change, with watchdog & rollback)
-#=============================================================================
-# Single source of truth for the hardening targets. Used by the drop-in
-# builder, the idempotency check, and the final verification.
 hardening_targets() {
     cat <<EOF
 Port:${SSH_PORT_FINAL}
@@ -1572,8 +1419,6 @@ build_sshd_block() {
 
 ssh_harden_already_applied() {
     local kv want got ports
-    # Port is cumulative: each declared port adds another listening socket.
-    # Require exactly the managed port so a leftover directive cannot hide.
     ports=$(effective_ssh_ports)
     [ "$ports" = "$SSH_PORT_FINAL" ] || return 1
     while IFS=: read -r kv want; do
@@ -1584,10 +1429,6 @@ ssh_harden_already_applied() {
     return 0
 }
 
-# Port is a cumulative directive in sshd_config: every Port line is listened
-# on. A leftover Port in the main file or in another drop-in would keep the
-# old port open even though our drop-in only declares the new one. Back up
-# and strip those lines, recording each file so rollback can undo it.
 clear_foreign_ssh_ports() {
     local f found=0
     for f in "$SSHD_CONFIG" "$SSHD_DROPIN_DIR"/*.conf; do
@@ -1622,8 +1463,6 @@ restore_stripped_port_files() {
     rm -f "$PORT_STRIP_LIST"
 }
 
-# H3: in socket-activation mode sshd binds the fd handed over by systemd and
-# ignores its own Port directive — migrate to the classic unit first.
 migrate_off_socket_activation() {
     log_info "Detected systemd socket activation (ssh.socket) — migrating to classic ssh.service mode..."
     if ! systemctl disable --now ssh.socket >/dev/null 2>&1; then
@@ -1639,7 +1478,6 @@ migrate_off_socket_activation() {
     return 0
 }
 
-# SELinux: allow sshd to bind the new port (required on enforcing RHEL family).
 selinux_prepare_port() {
     local port="$1"
     cmd_exists getenforce || return 0
@@ -1680,12 +1518,10 @@ rollback_ssh_hardening() {
         bak="${BK_DIR}/$(printf '%s' "$SSHD_CONFIG" | tr '/' '_').bak"
         [ -f "$bak" ] && cp -a "$bak" "$SSHD_CONFIG"
     fi
-    # Undo the Port stripping done by clear_foreign_ssh_ports: without this,
-    # a rollback could leave sshd on the default port instead of the original.
     restore_stripped_port_files
     if [ "$SSH_PORT_CHANGED" -eq 1 ]; then
         if [ "$abandoned" != "$SSH_PORT_ORIG" ]; then
-            fw_close_port "$abandoned"    # M4: reclaim the never-verified port
+            fw_close_port "$abandoned"
         fi
         SSH_PORT_FINAL="$SSH_PORT_ORIG"
         if [ "$FW_KIND" = "ufw" ]; then
@@ -1703,14 +1539,11 @@ rollback_ssh_hardening() {
     fi
 }
 
-# Dead-man switch: a transient systemd timer runs a self-contained rollback
-# script unless the user confirms at the gate. The script shares the flock:
-# while the main run is alive it just re-arms, so it can never fight with it.
 dms_arm() {
     local path ts
     ts=$(date '+%Y%m%d-%H%M%S')
     path="${BASE_DIR}/rollback-ssh-${ts}.sh"
-    rm -f "$CONFIRM_FLAG"    # stale marker from a previous run must not mute this run's watchdog
+    rm -f "$CONFIRM_FLAG"
     {
         printf '#!/usr/bin/env bash\n'
         printf '# Auto-generated rollback (dead-man switch) — vps-setup.sh\n'
@@ -1798,8 +1631,6 @@ DMS_BODY
 
 dms_disarm() {
     [ -n "$DMS_UNIT" ] || return 0
-    # Marker first: any re-armed timer that fires later sees it and removes
-    # itself instead of reverting confirmed configuration.
     : > "$CONFIRM_FLAG"
     systemctl stop "${DMS_UNIT}.timer" >/dev/null 2>&1
     systemctl stop "${DMS_UNIT}.service" >/dev/null 2>&1
@@ -1872,8 +1703,6 @@ EOF
 task_ssh_hardening() {
     local tmp clean wanted_port="$SSH_PORT_FINAL"
 
-    # Task 1 may have installed openssh-server after detect_os ran, so pick
-    # the keyword again against the now-available sshd binary.
     detect_kbd_keyword
 
     if ssh_harden_already_applied; then
@@ -1882,11 +1711,10 @@ task_ssh_hardening() {
         return 0
     fi
 
-    # H3: socket-activated sshd ignores Port — migrate before changing it.
     if [ "$SSH_SOCKET_MODE" -eq 1 ] && [ "$SSH_PORT_CHANGED" -eq 1 ]; then
         if ! migrate_off_socket_activation; then
             log_warn "Keeping the original port $SSH_PORT_ORIG instead"
-            fw_close_port "$wanted_port"    # M4: reclaim the port we cannot use
+            fw_close_port "$wanted_port"
             SSH_PORT_FINAL="$SSH_PORT_ORIG"
             SSH_PORT_CHANGED=0
         fi
@@ -1894,11 +1722,10 @@ task_ssh_hardening() {
         log_info "ssh.socket activation detected; port unchanged — no migration needed"
     fi
 
-    # Port change on enforcing SELinux requires ssh_port_t preparation first.
     if [ "$SSH_PORT_CHANGED" -eq 1 ]; then
         if ! selinux_prepare_port "$SSH_PORT_FINAL"; then
             log_warn "Keeping the original SSH port $SSH_PORT_ORIG instead"
-            fw_close_port "$wanted_port"    # M4: reclaim the abandoned port
+            fw_close_port "$wanted_port"
             SSH_PORT_FINAL="$SSH_PORT_ORIG"
             SSH_PORT_CHANGED=0
         fi
@@ -1911,9 +1738,6 @@ task_ssh_hardening() {
     log_info "Applying SSH hardening (root login off, port ${SSH_PORT_FINAL})..."
 
     if [ "$DROPIN_SUPPORTED" -eq 1 ]; then
-        # Snapshot the previous drop-in, then arm the watchdog BEFORE the
-        # first modification: a crash or Ctrl-C from here on must not leave
-        # an unconfirmed SSH change behind.
         if [ -f "$SSHD_DROPIN" ] && [ ! -f "${SSHD_DROPIN}.pre-vps-setup" ]; then
             cp -a "$SSHD_DROPIN" "${SSHD_DROPIN}.pre-vps-setup"
         fi
@@ -1922,7 +1746,7 @@ task_ssh_hardening() {
             dms_disarm
             log_error "Could not normalise Port directives — SSH configuration left unchanged"
             if [ "$SSH_PORT_CHANGED" -eq 1 ]; then
-                fw_close_port "$wanted_port"    # M4: reclaim the never-used port
+                fw_close_port "$wanted_port"
                 SSH_PORT_FINAL="$SSH_PORT_ORIG"
                 SSH_PORT_CHANGED=0
             fi
@@ -1934,8 +1758,6 @@ task_ssh_hardening() {
     else
         backup_file "$SSHD_CONFIG"
         dms_arm
-        # Remove any active occurrences of managed keywords (incl. Match
-        # blocks), then prepend our block — sshd uses first-match-wins.
         clean=$(mktemp) || { dms_disarm; return 0; }
         sed -r '/^[[:space:]]*(Port|PermitRootLogin|PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|UsePAM|PermitEmptyPasswords|MaxAuthTries|LoginGraceTime|ClientAliveInterval|ClientAliveCountMax|X11Forwarding|UseDNS)[[:space:]]/Id' "$SSHD_CONFIG" > "$clean"
         tmp=$(mktemp) || { dms_disarm; rm -f "$clean"; return 0; }
@@ -1980,13 +1802,7 @@ task_ssh_hardening() {
     if ssh_confirm_gate; then
         dms_disarm
         SSH_HARDEN_APPLIED=1
-        # The stripped Port directives are now intended; drop the rollback
-        # list so a later run cannot resurrect them. Backups stay in $BK_DIR.
         rm -f "$PORT_STRIP_LIST"
-        # The old port is closed at the very end of main(): the session that
-        # confirmed the change is still connected on it.
-        # Keep the FIRST pre-hardening drop-in in the permanent backup dir and
-        # stop leaving stale .pre-vps-setup files next to the live config.
         if [ "$DROPIN_SUPPORTED" -eq 1 ] && [ -f "${SSHD_DROPIN}.pre-vps-setup" ]; then
             mkdir -p "$BK_DIR"
             mv -f "${SSHD_DROPIN}.pre-vps-setup" "${BK_DIR}/$(printf '%s' "$SSHD_DROPIN" | tr '/' '_').first.bak"
@@ -1998,9 +1814,6 @@ task_ssh_hardening() {
     fi
 }
 
-#=============================================================================
-# Task 8 — fail2ban
-#=============================================================================
 systemd_journal_available_for_f2b() {
     if python3 -c 'import systemd' >/dev/null 2>&1; then
         return 0
@@ -2011,7 +1824,6 @@ systemd_journal_available_for_f2b() {
 task_fail2ban() {
     if ! cmd_exists fail2ban-client && ! pkg_installed fail2ban; then
         log_error "fail2ban is not installed — the SSH jail cannot be configured"
-        # M9: do not pull EPEL silently — tell the user exactly what to do.
         if [ "$FAMILY" = "rhel" ]; then
             log_warn "On RHEL-family systems fail2ban lives in EPEL. To enable it, run:"
             log_warn "  $PKG install -y epel-release        # RHEL proper: dnf install https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm"
@@ -2041,9 +1853,6 @@ task_fail2ban() {
 backend  = systemd"
     fi
 
-    # M2: compare without comments so the generated timestamp cannot make
-    # every re-run look "changed" (which rewrote the file and restarted
-    # fail2ban, clearing active bans, on every invocation).
     wanted=$(printf '%s\n' "$content" | grep -vE '^[[:space:]]*#' | tr -d '[:space:]')
     existing=$(grep -vE '^[[:space:]]*#' "$F2B_JAIL_LOCAL" 2>/dev/null | tr -d '[:space:]')
     if [ -f "$F2B_JAIL_LOCAL" ] && [ "$existing" = "$wanted" ]; then
@@ -2087,9 +1896,6 @@ backend  = systemd"
     fi
 }
 
-#=============================================================================
-# Task 9 — automatic security updates
-#=============================================================================
 task_auto_updates() {
     if [ "$DO_AUTOUPDATES" -ne 1 ]; then
         log_skip "Automatic security updates disabled by user input"
@@ -2173,9 +1979,6 @@ APT::Periodic::Unattended-Upgrade "1";'
     fi
 }
 
-#=============================================================================
-# Task 10 — time synchronization
-#=============================================================================
 task_time_sync() {
     if systemctl is-active --quiet systemd-timesyncd 2>/dev/null \
         || systemctl is-active --quiet chronyd 2>/dev/null \
@@ -2198,9 +2001,6 @@ task_time_sync() {
     fi
 }
 
-#=============================================================================
-# Task 11 — insecure listening port scan (report only)
-#=============================================================================
 task_port_scan() {
     local ports insecure=0 p
     ports=$(ss -tln 2>/dev/null | awk 'NR>1 {n=split($4, a, ":"); print a[n]}' | sort -un)
@@ -2222,14 +2022,9 @@ task_port_scan() {
     fi
 }
 
-#=============================================================================
-# Task 12 — final verification report (effective state, like the audits do)
-#=============================================================================
 task_verify() {
     local kv want got ports
     subheader "Effective SSH configuration (sshd -T)"
-    # Port is cumulative, so checking the first value is not enough: a leftover
-    # Port directive elsewhere would keep an extra port open.
     ports=$(effective_ssh_ports)
     if [ "$ports" = "$SSH_PORT_FINAL" ]; then
         log_ok "sshd: only port ${SSH_PORT_FINAL} is listened on"
@@ -2323,9 +2118,6 @@ task_verify() {
     fi
 }
 
-#=============================================================================
-# Summary
-#=============================================================================
 show_summary() {
     local reboot=0
     if [ -f /var/run/reboot-required ]; then
@@ -2360,10 +2152,7 @@ show_summary() {
     exit 0
 }
 
-#=============================================================================
-# Task runner + main
-#=============================================================================
-run_task() { # $1 index, $2 title, $3 function
+run_task() {
     step "$1" "$2"
     "$3"
 }
@@ -2407,13 +2196,8 @@ main() {
     run_task 11 "Insecure port scan"             task_port_scan
     run_task 12 "Final verification"             task_verify
 
-    # Hand apt's daily update machinery back if this run paused it.
     restore_apt_daily_timers
 
-    # Close every SSH port that is no longer managed, only after all tasks
-    # have finished. The session running this script (and the one that
-    # answered the gate) may still be connected on one of them, so closing
-    # earlier leaves it protected only by the firewall's conntrack state.
     if [ "$SSH_HARDEN_APPLIED" -eq 1 ]; then
         local p
         for p in "${ALL_SSH_PORTS[@]}"; do
