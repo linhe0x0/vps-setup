@@ -734,10 +734,23 @@ ask_password() {
 }
 
 ask_ssh_key() {
-    local line choice
+    local line choice home ak
     subheader "SSH login key"
     NO_KEY_AVAILABLE=0
-    if [ -s "$ROOT_KEYS_FILE" ] && grep -Eq '^(ssh-|ecdsa-|sk-)' "$ROOT_KEYS_FILE"; then
+    home=$(getent passwd "$NEW_USER" 2>/dev/null | cut -d: -f6)
+    ak="${home:+$home/.ssh/authorized_keys}"
+    if [ "$USER_EXISTS" -eq 1 ] && [ -s "$ak" ] && grep -Eq '^(ssh-|ecdsa-|sk-)' "$ak"; then
+        log_info "Key(s) currently authorized for '$NEW_USER':"
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            case "$line" in \#*) continue ;; esac
+            ssh-keygen -lf /dev/stdin <<< "$line" 2>/dev/null | awk '{print "  - " $0}'
+        done < "$ak"
+        if confirm_yn "Reuse these existing key(s) as-is?" "y"; then
+            SSH_KEYS_CONTENT=$(cat "$ak")
+        fi
+    fi
+    if [ -z "$SSH_KEYS_CONTENT" ] && [ -s "$ROOT_KEYS_FILE" ] && grep -Eq '^(ssh-|ecdsa-|sk-)' "$ROOT_KEYS_FILE"; then
         log_info "Key(s) currently authorized for root:"
         while IFS= read -r line; do
             [ -z "$line" ] && continue
@@ -768,6 +781,11 @@ ask_ssh_key() {
             prompt_read "Choose 1/2: " choice
             case "$choice" in
                 1)
+                    if [ "$USER_EXISTS" -eq 1 ] && [ -n "$home" ] && [ -s "$ak" ] && grep -Eq '^(ssh-|ecdsa-|sk-)' "$ak"; then
+                        SSH_KEYS_CONTENT=$(cat "$ak")
+                        log_ok "Found key(s) in $ak — full SSH hardening will be applied"
+                        break
+                    fi
                     if [ -s "$ROOT_KEYS_FILE" ] && grep -Eq '^(ssh-|ecdsa-|sk-)' "$ROOT_KEYS_FILE"; then
                         SSH_KEYS_CONTENT=$(cat "$ROOT_KEYS_FILE")
                         log_ok "Found key(s) in $ROOT_KEYS_FILE — full SSH hardening will be applied"
@@ -1167,7 +1185,7 @@ task_admin_user() {
         fi
     fi
 
-    local shell
+    local shell home ak
     shell=$(getent passwd "$NEW_USER" | cut -d: -f7)
     if [ "$shell" = "/usr/sbin/nologin" ] || [ "$shell" = "/bin/false" ]; then
         usermod -s /bin/bash "$NEW_USER"
@@ -1189,7 +1207,13 @@ task_admin_user() {
     if [ -n "$SSH_KEYS_CONTENT" ]; then
         install_user_keys "$NEW_USER" "$SSH_KEYS_CONTENT"
     else
-        log_skip "No SSH key provided for $NEW_USER"
+        home=$(getent passwd "$NEW_USER" 2>/dev/null | cut -d: -f6)
+        ak="${home:+$home/.ssh/authorized_keys}"
+        if [ "$USER_EXISTS" -eq 1 ] && [ -s "$ak" ] && grep -Eq '^(ssh-|ecdsa-|sk-)' "$ak"; then
+            log_skip "Keeping existing authorized_keys for $NEW_USER unchanged"
+        else
+            log_skip "No SSH key provided for $NEW_USER"
+        fi
     fi
 
     if [ -s "$ROOT_KEYS_FILE" ]; then
