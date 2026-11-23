@@ -124,6 +124,9 @@ EXTRA_PORTS=()
 DO_UPGRADE=1
 DO_AUTOUPDATES=1
 PKG_INDEX_UPDATED=0
+APT_DAILY_STOPPED=0     # 1 = apt-daily timers/services paused for this run
+APT_DAILY_WAS_ACTIVE="" # apt-daily timers that were active before the pause
+APT_BUSY_CHOICE=""      # answer chosen in resolve_busy_apt (wait|stop|abort)
 
 SSH_HARDEN_APPLIED=0
 DMS_UNIT=""
@@ -163,6 +166,7 @@ on_interrupt() {
 
 on_exit() {
     local rc=$?
+    restore_apt_daily_timers
     if [ "$REPORT_FINALIZED" -eq 0 ] && [ -n "${RESULT_FILE:-}" ] && [ -f "$RESULT_FILE" ]; then
         _log_append "STATUS" "run ended early (exit ${rc}) — partial state possible"
         finalize_report
@@ -347,19 +351,113 @@ ensure_dpkg_recovered() {
     return 1
 }
 
-wait_for_apt_lock() {
-    local i=0
+# Regex for processes that run or serve apt/dpkg work. Every alternative is
+# anchored with ($| ) so it matches the program itself, not incidental text
+# (log paths, the ever-running 'unattended-upgrade-shutdown' helper process
+# of unattended-upgrades.service, which holds no lock and used to stall
+# every wait here for the full timeout).
+readonly APT_BUSY_PGREP='(^|/)apt-get($| )|(^|/)apt($| )|(^|/)dpkg($| )|(^|/)unattended-upgrade($| )'
+
+apt_busy() {
+    pgrep -f "$APT_BUSY_PGREP" >/dev/null 2>&1 && return 0
+    if cmd_exists fuser; then
+        fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock >/dev/null 2>&1
+        return $?
+    fi
+    return 1
+}
+
+apt_holder_desc() {
+    local pid args
+    pid=$(pgrep -f "$APT_BUSY_PGREP" 2>/dev/null | head -n 1)
+    [ -n "$pid" ] || return 1
+    args=$(ps -o args= -p "$pid" 2>/dev/null | cut -c1-60)
+    printf 'PID %s (%s)' "$pid" "${args:-just exited}"
+}
+
+# Asked once per ~5-minute wait window while apt/dpkg is still busy.
+resolve_busy_apt() { # $1 holder description; sets APT_BUSY_CHOICE
+    log_warn "apt/dpkg is still busy after ~5 minutes ($1)."
+    if [ "$APT_DAILY_STOPPED" -eq 1 ]; then
+        die "Daily auto-update tasks were already stopped but apt/dpkg is still busy. Resolve it manually, then re-run this script."
+    fi
+    local ans
     while :; do
-        if ! pgrep -f '(^|/)apt-get|(^|/)dpkg|(^|/)unattended-upgrade' >/dev/null 2>&1 \
-            && ! { cmd_exists fuser && fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock >/dev/null 2>&1; }; then
+        prompt_read "[w]ait 5 more minutes / [s]top daily auto-update tasks and proceed / [a]bort [w]: " ans
+        ans="${ans:-w}"
+        case "$ans" in
+            w|W) APT_BUSY_CHOICE="wait";  return 0 ;;
+            s|S) APT_BUSY_CHOICE="stop";  return 0 ;;
+            a|A) APT_BUSY_CHOICE="abort"; return 0 ;;
+            *)   printf 'Please answer w, s or a.\n' ;;
+        esac
+    done
+}
+
+# Pause apt's daily update machinery at user request so this run can use
+# apt/dpkg immediately. Timers stop first to prevent a re-trigger; the
+# services stop gracefully (KillMode=process lets the running upgrade
+# finish its current package and checkpoint state for the next scheduled
+# run). What was active before is restarted by restore_apt_daily_timers.
+stop_apt_daily_units() {
+    local t
+    for t in apt-daily.timer apt-daily-upgrade.timer; do
+        if systemctl is-active --quiet "$t" 2>/dev/null; then
+            APT_DAILY_WAS_ACTIVE="$APT_DAILY_WAS_ACTIVE $t"
+        fi
+    done
+    log_info "Stopping apt-daily timers and services (restored automatically when this run ends)..."
+    systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null
+    systemctl stop apt-daily.service apt-daily-upgrade.service 2>/dev/null
+    APT_DAILY_STOPPED=1
+    log_ok "apt-daily timers/services stopped"
+}
+
+# Restart the apt-daily timers paused by stop_apt_daily_units. Called from
+# main() after the tasks and again from on_exit, so every exit path
+# (normal end, die, interrupt) hands the daily updates back.
+restore_apt_daily_timers() {
+    [ "$APT_DAILY_STOPPED" -eq 1 ] || return 0
+    APT_DAILY_STOPPED=0
+    local t
+    for t in $APT_DAILY_WAS_ACTIVE; do
+        if systemctl start "$t" 2>/dev/null; then
+            log_ok "Restored $t"
+        else
+            log_warn "Could not re-start $t — check 'systemctl status $t'"
+        fi
+    done
+    APT_DAILY_WAS_ACTIVE=""
+}
+
+# Wait (with visible progress) until no apt/dpkg work is running, then let
+# the caller proceed. An idle system passes immediately. If work is still
+# running after ~5 minutes, the user chooses: keep waiting, stop the daily
+# auto-update tasks (they are restored when the run ends), or abort.
+wait_for_apt_lock() {
+    local i=0 waited=0 desc
+    while :; do
+        if ! apt_busy; then
+            [ "$waited" -eq 1 ] && log_ok "apt/dpkg lock released"
             return 0
         fi
+        waited=1
         i=$((i + 1))
-        if [ "$i" -gt 40 ]; then
-            log_warn "apt/dpkg is still busy after ~10 minutes; continuing anyway"
-            return 1
+        if [ "$i" -gt 20 ]; then
+            desc=$(apt_holder_desc) || desc="unknown holder"
+            resolve_busy_apt "$desc"
+            case "$APT_BUSY_CHOICE" in
+                wait)  i=0 ;;
+                stop)  stop_apt_daily_units; i=0 ;;
+                abort) die "Aborted at user request — apt/dpkg is still busy. Re-run this script once it is free (it is idempotent)." ;;
+            esac
+            continue
         fi
-        [ "$i" -eq 1 ] && log_info "Waiting for a running apt/dpkg process to finish..."
+        if [ "$i" -eq 1 ]; then
+            log_info "Waiting for a running apt/dpkg process to finish..."
+        elif [ $((i % 4)) -eq 0 ]; then
+            log_info "apt/dpkg still busy after ~$(((i - 1) * 15))s: $(apt_holder_desc || echo 'holder unknown')"
+        fi
         sleep 15
     done
 }
@@ -371,7 +469,7 @@ refresh_pkg_index() {
     [ "$PKG_INDEX_UPDATED" -eq 1 ] && return 0
     case "$FAMILY" in
         debian)
-            wait_for_apt_lock || true
+            wait_for_apt_lock
             ensure_dpkg_recovered || true
             log_info "Updating package index..."
             if apt-get update -y >/dev/null 2>&1; then
@@ -1001,7 +1099,7 @@ task_system_update() {
             log_skip "System upgrade disabled by user input"
             return 0
         fi
-        wait_for_apt_lock || true
+        wait_for_apt_lock
         ensure_dpkg_recovered || true
         cnt=$(apt-get -s upgrade 2>/dev/null | grep -c '^Inst ' || true)
         if [ "${cnt:-0}" -eq 0 ]; then
@@ -2308,6 +2406,9 @@ main() {
     run_task 10 "Time synchronization"           task_time_sync
     run_task 11 "Insecure port scan"             task_port_scan
     run_task 12 "Final verification"             task_verify
+
+    # Hand apt's daily update machinery back if this run paused it.
+    restore_apt_daily_timers
 
     # Close every SSH port that is no longer managed, only after all tasks
     # have finished. The session running this script (and the one that
